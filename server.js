@@ -12,8 +12,8 @@ const PORT = process.env.PORT || 3000;
 // MySQL配置 - 直接写在代码中
 const dbConfig = {
   host: '120.26.16.9',
-  user: 'root',
-  password: 'Ryx050609',
+  user: 'novel_user',
+  password: 'Novel@050609',
   database: 'novel_app',
   port: 3306
 };
