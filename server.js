@@ -2,33 +2,59 @@ const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const path = require('path');
-const mongoose = require('mongoose');
+const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+
+// MySQL配置 - 直接写在代码中
+const dbConfig = {
+  host: '120.26.16.9',
+  user: 'root',
+  password: 'Ryx050609',
+  database: 'novel_app',
+  port: 3306
+};
+
+// 创建连接池
+const pool = mysql.createPool(dbConfig);
+
+// 初始化数据库表
+async function initDatabase() {
+  try {
+    const connection = await pool.getConnection();
+    
+    // 创建用户表
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    console.log('✅ 数据库表初始化成功');
+    connection.release();
+  } catch (error) {
+    console.error('❌ 数据库初始化失败:', error.message);
+  }
+}
+
+// 调用初始化
+initDatabase();
 
 // 中间件
 app.use(cors());
 app.use(express.json());
 
-// MongoDB连接
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/novel-app';
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('✅ MongoDB连接成功'))
-  .catch(err => console.error('❌ MongoDB连接失败:', err));
-
-// 用户模型
-const userSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true },
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const User = mongoose.model('User', userSchema);
+// 直接写在代码中的密钥
+const JWT_SECRET = 'your-very-strong-secret-key-for-jwt-encryption';
+const API_KEY = 'a14b5cdff147b1262882db2ca29355bd';
+const BASE_URL = 'https://api.xcvts.cn/api/xiaoshuo/axdzs';
 
 // 认证中间件
 const authenticateToken = (req, res, next) => {
@@ -48,10 +74,7 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// API配置
-const API_KEY = process.env.API_KEY || 'a14b5cdff147b1262882db2ca29355bd';
-const BASE_URL = 'https://api.xcvts.cn/api/xiaoshuo/axdzs';
-
+// API请求函数
 function makeRequest(url) {
   return new Promise((resolve, reject) => {
     https.get(url, (response) => {
@@ -78,11 +101,12 @@ app.post('/api/register', async (req, res) => {
     }
 
     // 检查用户是否已存在
-    const existingUser = await User.findOne({ 
-      $or: [{ email }, { username }] 
-    });
+    const [existingUsers] = await pool.execute(
+      'SELECT id FROM users WHERE email = ? OR username = ?',
+      [email, username]
+    );
     
-    if (existingUser) {
+    if (existingUsers.length > 0) {
       return res.status(400).json({ error: '用户名或邮箱已存在' });
     }
 
@@ -90,16 +114,21 @@ app.post('/api/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     // 创建用户
-    const user = new User({ username, email, password: hashedPassword });
-    await user.save();
+    const [result] = await pool.execute(
+      'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+      [username, email, hashedPassword]
+    );
 
     // 生成JWT令牌
-    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET);
+    const token = jwt.sign(
+      { userId: result.insertId, username: username }, 
+      JWT_SECRET
+    );
 
     res.status(201).json({
       message: '注册成功',
       token,
-      user: { id: user._id, username: user.username, email: user.email }
+      user: { id: result.insertId, username, email }
     });
 
   } catch (error) {
@@ -118,10 +147,16 @@ app.post('/api/login', async (req, res) => {
     }
 
     // 查找用户
-    const user = await User.findOne({ email });
-    if (!user) {
+    const [users] = await pool.execute(
+      'SELECT * FROM users WHERE email = ?',
+      [email]
+    );
+    
+    if (users.length === 0) {
       return res.status(400).json({ error: '用户不存在' });
     }
+
+    const user = users[0];
 
     // 验证密码
     const isValidPassword = await bcrypt.compare(password, user.password);
@@ -130,12 +165,15 @@ app.post('/api/login', async (req, res) => {
     }
 
     // 生成JWT令牌
-    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET);
+    const token = jwt.sign(
+      { userId: user.id, username: user.username }, 
+      JWT_SECRET
+    );
 
     res.json({
       message: '登录成功',
       token,
-      user: { id: user._id, username: user.username, email: user.email }
+      user: { id: user.id, username: user.username, email: user.email }
     });
 
   } catch (error) {
@@ -147,8 +185,16 @@ app.post('/api/login', async (req, res) => {
 // 获取用户信息
 app.get('/api/user', authenticateToken, async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId).select('-password');
-    res.json(user);
+    const [users] = await pool.execute(
+      'SELECT id, username, email, created_at FROM users WHERE id = ?',
+      [req.user.userId]
+    );
+    
+    if (users.length === 0) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+
+    res.json(users[0]);
   } catch (error) {
     res.status(500).json({ error: '获取用户信息失败' });
   }
@@ -164,6 +210,8 @@ app.get('/api/search', authenticateToken, async (req, res) => {
     }
     
     const apiUrl = `${BASE_URL}?apiKey=${API_KEY}&q=${encodeURIComponent(query)}`;
+    console.log('搜索请求:', apiUrl);
+    
     const data = await makeRequest(apiUrl);
     
     res.json(data);
@@ -183,6 +231,8 @@ app.get('/api/download', authenticateToken, async (req, res) => {
     }
     
     const downloadUrl = `${BASE_URL}?apiKey=${API_KEY}&q=${encodeURIComponent(q)}&n=${n}`;
+    console.log('下载重定向:', downloadUrl);
+    
     res.redirect(downloadUrl);
   } catch (error) {
     console.error('下载错误:', error);
@@ -190,20 +240,44 @@ app.get('/api/download', authenticateToken, async (req, res) => {
   }
 });
 
-// 静态文件服务
+// 健康检查端点
+app.get('/api/health', async (req, res) => {
+  try {
+    // 测试数据库连接
+    await pool.execute('SELECT 1');
+    res.json({ 
+      status: 'ok', 
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'error', 
+      database: 'disconnected',
+      error: error.message 
+    });
+  }
+});
+
+// 提供静态文件（HTML页面）
 app.use(express.static('.'));
 
-// 根路径
+// 根路径返回首页
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 服务器启动
+// 只在非Vercel环境下启动服务器监听
 if (process.env.VERCEL !== '1') {
   app.listen(PORT, () => {
     console.log(`🚀 服务器运行在 http://localhost:${PORT}`);
+    console.log(`🗄️  MySQL数据库已连接`);
     console.log(`🔐 用户认证系统已启用`);
+    console.log(`🔍 搜索接口: http://localhost:${PORT}/api/search?q=小说名称`);
+    console.log(`📥 下载接口: http://localhost:${PORT}/api/download?q=小说名称&n=序号`);
+    console.log(`🌐 网页地址: http://localhost:${PORT}`);
   });
 }
 
+// 导出app给Vercel使用
 module.exports = app;
